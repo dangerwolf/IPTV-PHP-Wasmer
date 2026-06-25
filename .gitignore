@@ -2,7 +2,9 @@
 
 # .gitignore
 *.log
-.DS_Store
 .env
+*.log
+.DS_Store
+Thumbs.db
 # 如果 .so 文件较大且有替代来源，可以不提交
 # app/ext/*.so

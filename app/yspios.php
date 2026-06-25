@@ -101,7 +101,7 @@ class CKeyManager
      */
     public function __construct()
     {
-        error_reporting(E_ALL);
+        error_reporting(E_ALL & ~E_DEPRECATED);
         ini_set('display_errors', 1);
         date_default_timezone_set('Asia/Shanghai');
         // 初始化时生成一个随机GUID

@@ -113,19 +113,7 @@ class CKeyManager
      */
     private function generateGuid()
     {
-        $this->guid = sprintf('%08s%04s%04s%04s%12s',
-            dechex(mt_rand(0, 0xffffffff)),
-            dechex(mt_rand(0, 0xffff)),
-            dechex(mt_rand(0, 0xffff)),
-            dechex(mt_rand(0, 0xffff)),
-            dechex(mt_rand(0, 0xffffffffffff))
-        );
-        
-        // 确保GUID是32位十六进制字符串（不带连字符）
-        if (strlen($this->guid) !== 32) {
-            $this->guid = str_pad($this->guid, 32, '0', STR_PAD_LEFT);
-        }
-        
+        $this->guid = bin2hex(random_bytes(16));
         return $this->guid;
     }
     

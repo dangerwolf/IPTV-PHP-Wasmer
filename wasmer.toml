@@ -1,0 +1,12 @@
+[package]
+name = "your-username/cctv-play-proxy"
+version = "0.1.0"
+description = "CCTV Live Stream Proxy"
+
+[[module]]
+name = "php"
+source = "php-cgi.wasm"
+abi = "wasi"
+
+[module.interfaces]
+wasi = "0.0.0-unstable"

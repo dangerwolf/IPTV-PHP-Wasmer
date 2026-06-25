@@ -1,18 +1,5 @@
 <?php
 date_default_timezone_set('Asia/Shanghai');
-
-// === 诊断代码 START ===
-
-header('Content-Type: application/json');
-echo json_encode([
-    'PHP_INT_SIZE' => PHP_INT_SIZE,    // 4 = 32位, 8 = 64位
-    'PHP_INT_MAX'  => PHP_INT_MAX,
-    'PHP_VERSION'  => PHP_VERSION,
-], JSON_PRETTY_PRINT);
-exit();
-// === 诊断代码 END ===
-
-
 $id = isset($_GET['id']) ? $_GET['id'] : 'cctv1';
 $n = [
     'cctv1' => ['2024078201', '600001859', 'fhd'], //CCTV-1高清
@@ -114,7 +101,7 @@ class CKeyManager
      */
     public function __construct()
     {
-        error_reporting(E_ALL & ~E_DEPRECATED);
+        error_reporting(E_ALL);
         ini_set('display_errors', 1);
         date_default_timezone_set('Asia/Shanghai');
         // 初始化时生成一个随机GUID
@@ -126,7 +113,19 @@ class CKeyManager
      */
     private function generateGuid()
     {
-        $this->guid = bin2hex(random_bytes(16));
+        $this->guid = sprintf('%08s%04s%04s%04s%12s',
+            dechex(mt_rand(0, 0xffffffff)),
+            dechex(mt_rand(0, 0xffff)),
+            dechex(mt_rand(0, 0xffff)),
+            dechex(mt_rand(0, 0xffff)),
+            dechex(mt_rand(0, 0xffffffffffff))
+        );
+        
+        // 确保GUID是32位十六进制字符串（不带连字符）
+        if (strlen($this->guid) !== 32) {
+            $this->guid = str_pad($this->guid, 32, '0', STR_PAD_LEFT);
+        }
+        
         return $this->guid;
     }
     

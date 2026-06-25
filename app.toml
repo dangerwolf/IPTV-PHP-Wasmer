@@ -1,0 +1,11 @@
+[application]
+name = "cctv-play-proxy"
+
+[[application.http]]
+# 所有 HTTP 请求交给 PHP 处理
+command = "php-cgi"
+args = ["-c", "/app/config/php.ini", "/app/app/index.php", "/app/app/yspios.php"]
+
+[application.http.environment]
+# 如果你的 .so 需要显式加载路径
+PHP_INI_SCAN_DIR = "/app/config"

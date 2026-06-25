@@ -2,40 +2,13 @@
 date_default_timezone_set('Asia/Shanghai');
 
 // === 诊断代码 START ===
-$diag = [];
 
-// 1. 检查 curl 是否可用
-$diag['curl_loaded'] = extension_loaded('curl') ? 'YES' : 'NO';
-
-// 2. 检查 allow_url_fopen
-$diag['allow_url_fopen'] = ini_get('allow_url_fopen') ? 'ON' : 'OFF';
-
-// 3. 测试能否访问外部地址
-$testResult = @file_get_contents('https://httpbin.org/ip', false, stream_context_create([
-    'http' => ['timeout' => 5]
-]));
-$diag['file_get_contents_test'] = $testResult ? 'SUCCESS: ' . substr($testResult, 0, 100) : 'FAILED';
-
-// 4. 如果 curl 可用，也测试一下
-if (extension_loaded('curl')) {
-    $ch = curl_init('https://httpbin.org/ip');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    $curlResult = curl_exec($ch);
-    $diag['curl_test'] = $curlResult ? 'SUCCESS: ' . substr($curlResult, 0, 100) : 'FAILED: ' . curl_error($ch);
-    curl_close($ch);
-}
-
-// 5. 测试目标地址
-$targetTest = @file_get_contents('https://bkliveinfo.ysp.cctv.cn', false, stream_context_create([
-    'http' => ['timeout' => 5]
-]));
-$diag['target_reachable'] = $targetTest !== false ? 'YES' : 'NO';
-
-// 输出诊断结果
 header('Content-Type: application/json');
-echo json_encode($diag, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+echo json_encode([
+    'PHP_INT_SIZE' => PHP_INT_SIZE,    // 4 = 32位, 8 = 64位
+    'PHP_INT_MAX'  => PHP_INT_MAX,
+    'PHP_VERSION'  => PHP_VERSION,
+], JSON_PRETTY_PRINT);
 exit();
 // === 诊断代码 END ===
 

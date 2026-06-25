@@ -87,48 +87,35 @@ class CKeyManager
     const ZERO_LEN = 7;
     const TEA_CKEY = '59b2f7cf725ef43c34fdd7c123411ed3';
     const GUARD_TEA_KEY = '110DBEC10C23E7D2E56A1CAD6914EF1B';
-    
+
     private $xorKey = [0x84, 0x2E, 0xED, 0x08, 0xF0, 0x66, 0xE6, 0xEA, 0x48, 0xB4, 0xCA, 0xA9, 0x91, 0xED, 0x6F, 0xF3];
     private $guardXorKey = [0xB3, 0xC9, 0x53, 0xA0, 0x69, 0x13, 0xAD, 0x4D];
     private $standardAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
     private $customAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-=';
-    
+
     // 当前使用的GUID
     private $guid = '';
-    
+
     /**
      * 构造函数
      */
     public function __construct()
     {
-        error_reporting(E_ALL);
+        error_reporting(E_ALL & ~E_DEPRECATED);
         ini_set('display_errors', 1);
         date_default_timezone_set('Asia/Shanghai');
-        // 初始化时生成一个随机GUID
         $this->generateGuid();
     }
-    
+
     /**
-     * 生成随机GUID
+     * 生成随机GUID（32位安全：使用random_bytes替代mt_rand大数值）
      */
     private function generateGuid()
     {
-        $this->guid = sprintf('%08s%04s%04s%04s%12s',
-            dechex(mt_rand(0, 0xffffffff)),
-            dechex(mt_rand(0, 0xffff)),
-            dechex(mt_rand(0, 0xffff)),
-            dechex(mt_rand(0, 0xffff)),
-            dechex(mt_rand(0, 0xffffffffffff))
-        );
-        
-        // 确保GUID是32位十六进制字符串（不带连字符）
-        if (strlen($this->guid) !== 32) {
-            $this->guid = str_pad($this->guid, 32, '0', STR_PAD_LEFT);
-        }
-        
+        $this->guid = bin2hex(random_bytes(16));
         return $this->guid;
     }
-    
+
     /**
      * 获取当前GUID
      */
@@ -136,7 +123,7 @@ class CKeyManager
     {
         return $this->guid;
     }
-    
+
     /**
      * 设置自定义GUID
      */
@@ -144,7 +131,7 @@ class CKeyManager
     {
         $this->guid = $guid;
     }
-    
+
     /**
      * 重置GUID（生成新的随机GUID）
      */
@@ -152,9 +139,59 @@ class CKeyManager
     {
         return $this->generateGuid();
     }
-    
+
+    // ================== 32位安全 无符号32位算术（用两个16位值表示） ===================
+    // 格式: [high_16bits, low_16bits]，每个值 0~65535，兼容32位和64位PHP
+
+    private function u32Unpack($bytes, $offset = 0)
+    {
+        $hi = unpack('n', substr($bytes, $offset, 2))[1];
+        $lo = unpack('n', substr($bytes, $offset + 2, 2))[1];
+        return [$hi, $lo];
+    }
+
+    private function u32Pack($a)
+    {
+        return pack('n', $a[0]) . pack('n', $a[1]);
+    }
+
+    private function u32Add($a, $b)
+    {
+        $lo = $a[1] + $b[1];
+        $hi = $a[0] + $b[0] + ($lo >> 16);
+        return [$hi & 0xFFFF, $lo & 0xFFFF];
+    }
+
+    private function u32Sub($a, $b)
+    {
+        $lo = $a[1] - $b[1];
+        $borrow = 0;
+        if ($lo < 0) { $lo += 0x10000; $borrow = 1; }
+        $hi = ($a[0] - $b[0] - $borrow) & 0xFFFF;
+        return [$hi, $lo & 0xFFFF];
+    }
+
+    private function u32Shl4($a)
+    {
+        $new_hi = (($a[0] << 4) | ($a[1] >> 12)) & 0xFFFF;
+        $new_lo = ($a[1] << 4) & 0xFFFF;
+        return [$new_hi, $new_lo];
+    }
+
+    private function u32Shr5($a)
+    {
+        $new_hi = ($a[0] >> 5) & 0xFFFF;
+        $new_lo = (($a[0] & 0x1F) << 11) | ($a[1] >> 5);
+        return [$new_hi, $new_lo & 0xFFFF];
+    }
+
+    private function u32Xor($a, $b)
+    {
+        return [$a[0] ^ $b[0], $a[1] ^ $b[1]];
+    }
+
     // ================== 辅助函数 ===================
-    
+
     /**
      * 生成随机十六进制字符串
      */
@@ -186,20 +223,36 @@ class CKeyManager
         $h265_str = implode(',', $h265_parts);
         $spvcode_raw = "H({$h264_str}|{$h264_str});2({$h265_str}|{$h265_str})";
         return base64_encode($spvcode_raw);
-}
+    }
 
     /**
-     * 计算签名
+     * 计算签名（32位安全：使用16位分解避免溢出）
      */
     private function calcSignature($buffer)
     {
-        $signature = 0;
+        // 签名是31位值，分解为 hi15 + lo16
+        $sig_hi = 0;
+        $sig_lo = 0;
+
         foreach ($buffer as $byte) {
-            $signature = (0x83 * $signature + ($byte & 0xFF)) & 0x7FFFFFFF;
+            // sig = sig * 0x83 + byte, then & 0x7FFFFFFF
+            $lo = $sig_lo * 0x83;
+            $carry = $lo >> 16;
+            $lo &= 0xFFFF;
+            $hi = $sig_hi * 0x83 + $carry;
+            $hi &= 0x7FFF;
+
+            $lo += ($byte & 0xFF);
+            if ($lo >= 0x10000) { $lo -= 0x10000; $hi++; }
+            $hi &= 0x7FFF;
+
+            $sig_hi = $hi;
+            $sig_lo = $lo;
         }
-        return $signature;
+
+        return ($sig_hi << 16) | $sig_lo;
     }
-    
+
     /**
      * 自定义Base64解码
      */
@@ -210,33 +263,33 @@ class CKeyManager
         if (strlen($text) % 4 != 0) {
             $text .= str_repeat('=', 4 - (strlen($text) % 4));
         }
-        
+
         $translationTable = [];
         $len = min(strlen($this->customAlphabet), strlen($this->standardAlphabet));
         for ($i = 0; $i < $len; $i++) {
             $translationTable[$this->customAlphabet[$i]] = $this->standardAlphabet[$i];
         }
-        
+
         $translatedStr = strtr($text, $translationTable);
         return base64_decode($translatedStr);
     }
-    
+
     /**
      * 自定义Base64编码
      */
     private function customEncode($text)
     {
         $encoded = base64_encode($text);
-        
+
         $translationTable = [];
         $len = min(strlen($this->standardAlphabet), strlen($this->customAlphabet));
         for ($i = 0; $i < $len; $i++) {
             $translationTable[$this->standardAlphabet[$i]] = $this->customAlphabet[$i];
         }
-        
+
         return rtrim(strtr($encoded, $translationTable), '=');
     }
-    
+
     /**
      * XOR加密/解密
      */
@@ -249,98 +302,120 @@ class CKeyManager
         }
         return $retArray;
     }
-    
-    // ================== TEA加解密函数 ===================
-    
+
+    // ================== TEA加解密函数（32位安全版） ===================
+
     /**
-     * TEA ECB模式加密
+     * TEA ECB模式加密（使用u32对算术，兼容32位PHP）
      */
     private function teaEncryptECB($pInBuf, $pKey)
     {
         if (strlen($pInBuf) < 8) {
             $pInBuf = str_pad($pInBuf, 8, "\0");
         }
-        
-        $unpacked = unpack('N2', $pInBuf);
-        $y = $unpacked[1];
-        $z = $unpacked[2];
-        
+
+        $y = $this->u32Unpack($pInBuf, 0);
+        $z = $this->u32Unpack($pInBuf, 4);
+
         $k = [
-            unpack('N', substr($pKey, 0, 4))[1],
-            unpack('N', substr($pKey, 4, 4))[1],
-            unpack('N', substr($pKey, 8, 4))[1],
-            unpack('N', substr($pKey, 12, 4))[1]
+            $this->u32Unpack($pKey, 0),
+            $this->u32Unpack($pKey, 4),
+            $this->u32Unpack($pKey, 8),
+            $this->u32Unpack($pKey, 12)
         ];
-        
-        $sum = 0;
+
+        // DELTA = 0x9e3779b9 = [0x9E37, 0x79B9]
+        $delta = [0x9E37, 0x79B9];
+        $sum = [0, 0];
+
         for ($i = 0; $i < self::ROUNDS; $i++) {
-            $sum = ($sum + self::DELTA) & 0xFFFFFFFF;
-            $y = ($y + ((($z << 4) + $k[0]) ^ ($z + $sum) ^ (($z >> 5) + $k[1]))) & 0xFFFFFFFF;
-            $z = ($z + ((($y << 4) + $k[2]) ^ ($y + $sum) ^ (($y >> 5) + $k[3]))) & 0xFFFFFFFF;
+            $sum = $this->u32Add($sum, $delta);
+            $y = $this->u32Add($y, $this->u32Xor(
+                $this->u32Xor(
+                    $this->u32Add($this->u32Shl4($z), $k[0]),
+                    $this->u32Add($z, $sum)
+                ),
+                $this->u32Add($this->u32Shr5($z), $k[1])
+            ));
+            $z = $this->u32Add($z, $this->u32Xor(
+                $this->u32Xor(
+                    $this->u32Add($this->u32Shl4($y), $k[2]),
+                    $this->u32Add($y, $sum)
+                ),
+                $this->u32Add($this->u32Shr5($y), $k[3])
+            ));
         }
-        
-        return pack('N2', $y, $z);
+
+        return $this->u32Pack($y) . $this->u32Pack($z);
     }
-    
+
     /**
-     * TEA ECB模式解密
+     * TEA ECB模式解密（使用u32对算术，兼容32位PHP）
      */
     private function teaDecryptECB($pInBuf, $pKey)
     {
-        $unpacked = unpack('N2', $pInBuf);
-        $y = $unpacked[1];
-        $z = $unpacked[2];
-        
+        $y = $this->u32Unpack($pInBuf, 0);
+        $z = $this->u32Unpack($pInBuf, 4);
+
         $k = [
-            unpack('N', substr($pKey, 0, 4))[1],
-            unpack('N', substr($pKey, 4, 4))[1],
-            unpack('N', substr($pKey, 8, 4))[1],
-            unpack('N', substr($pKey, 12, 4))[1]
+            $this->u32Unpack($pKey, 0),
+            $this->u32Unpack($pKey, 4),
+            $this->u32Unpack($pKey, 8),
+            $this->u32Unpack($pKey, 12)
         ];
-        
-        $sum = (self::DELTA << self::LOG_ROUNDS) & 0xFFFFFFFF;
-        
+
+        // sum = DELTA * 16 = 0x9e3779b9 * 16 = 0xe3779b90
+        $sum = [0xE377, 0x9B90];
+        $delta = [0x9E37, 0x79B9];
+
         for ($i = 0; $i < self::ROUNDS; $i++) {
-            $z = ($z - ((($y << 4) + $k[2]) ^ ($y + $sum) ^ (($y >> 5) + $k[3]))) & 0xFFFFFFFF;
-            $y = ($y - ((($z << 4) + $k[0]) ^ ($z + $sum) ^ (($z >> 5) + $k[1]))) & 0xFFFFFFFF;
-            $sum = ($sum - self::DELTA) & 0xFFFFFFFF;
+            $z = $this->u32Sub($z, $this->u32Xor(
+                $this->u32Xor(
+                    $this->u32Add($this->u32Shl4($y), $k[2]),
+                    $this->u32Add($y, $sum)
+                ),
+                $this->u32Add($this->u32Shr5($y), $k[3])
+            ));
+            $y = $this->u32Sub($y, $this->u32Xor(
+                $this->u32Xor(
+                    $this->u32Add($this->u32Shl4($z), $k[0]),
+                    $this->u32Add($z, $sum)
+                ),
+                $this->u32Add($this->u32Shr5($z), $k[1])
+            ));
+            $sum = $this->u32Sub($sum, $delta);
         }
-        
-        return pack('N2', $y, $z);
+
+        return $this->u32Pack($y) . $this->u32Pack($z);
     }
-    
+
     // ================== CBC模式加解密 ===================
-    
+
     /**
      * CBC模式加密
      */
     private function oiSymmetryEncrypt2($pInBuf, $nInBufLen, $pKey)
     {
-        // 计算填充长度
         $nPadSaltBodyZeroLen = $nInBufLen + 1 + self::SALT_LEN + self::ZERO_LEN;
         $nPadlen = $nPadSaltBodyZeroLen % 8;
         if ($nPadlen) {
             $nPadlen = 8 - $nPadlen;
         }
-        
+
         $pOutBuf = '';
-        
-        // 第一块数据
         $src_buf = array_fill(0, 8, 0);
         $src_buf[0] = (mt_rand(0, 255) & 0xF8) | $nPadlen;
         $src_i = 1;
-        
-        // 填充
+
         while ($nPadlen) {
             $src_buf[$src_i] = mt_rand(0, 255);
             $src_i++;
             $nPadlen--;
         }
-        
+
         $iv_plain = array_fill(0, 8, 0);
         $iv_crypt = $iv_plain;
-        
-        // 处理Salt
+
         $i = 0;
         while ($i < self::SALT_LEN) {
             if ($src_i < 8) {
@@ -348,29 +423,22 @@ class CKeyManager
                 $src_i++;
                 $i++;
             }
-            
             if ($src_i == 8) {
-                // 异或前一块密文
                 for ($j = 0; $j < 8; $j++) {
                     $src_buf[$j] ^= $iv_crypt[$j];
                 }
-                
                 $temp_out = $this->teaEncryptECB(pack('C*', ...$src_buf), $pKey);
                 $temp_bytes = array_values(unpack('C*', $temp_out));
-                
-                // 异或前一块明文
                 for ($j = 0; $j < 8; $j++) {
                     $temp_bytes[$j] ^= $iv_plain[$j];
                 }
-                
                 $iv_plain = $src_buf;
                 $iv_crypt = $temp_bytes;
                 $pOutBuf .= pack('C*', ...$temp_bytes);
                 $src_i = 0;
             }
         }
-        
-        // 处理主体数据
+
         $pInBufIndex = 0;
         while ($nInBufLen) {
             if ($src_i < 8) {
@@ -379,29 +447,22 @@ class CKeyManager
                 $src_i++;
                 $nInBufLen--;
             }
-            
             if ($src_i == 8) {
-                // 异或前一块密文
                 for ($j = 0; $j < 8; $j++) {
                     $src_buf[$j] ^= $iv_crypt[$j];
                 }
-                
                 $temp_out = $this->teaEncryptECB(pack('C*', ...$src_buf), $pKey);
                 $temp_bytes = array_values(unpack('C*', $temp_out));
-                
-                // 异或前一块明文
                 for ($j = 0; $j < 8; $j++) {
                     $temp_bytes[$j] ^= $iv_plain[$j];
                 }
-                
                 $iv_plain = $src_buf;
                 $iv_crypt = $temp_bytes;
                 $pOutBuf .= pack('C*', ...$temp_bytes);
                 $src_i = 0;
             }
         }
-        
-        // 处理Zero填充
+
         $i = 0;
         while ($i < self::ZERO_LEN) {
             if ($src_i < 8) {
@@ -409,54 +470,40 @@ class CKeyManager
                 $src_i++;
                 $i++;
             }
-            
             if ($src_i == 8) {
-                // 异或前一块密文
                 for ($j = 0; $j < 8; $j++) {
                     $src_buf[$j] ^= $iv_crypt[$j];
                 }
-                
                 $temp_out = $this->teaEncryptECB(pack('C*', ...$src_buf), $pKey);
                 $temp_bytes = array_values(unpack('C*', $temp_out));
-                
-                // 异或前一块明文
                 for ($j = 0; $j < 8; $j++) {
                     $temp_bytes[$j] ^= $iv_plain[$j];
                 }
-                
                 $iv_plain = $src_buf;
                 $iv_crypt = $temp_bytes;
                 $pOutBuf .= pack('C*', ...$temp_bytes);
                 $src_i = 0;
             }
         }
-        
-        // 处理最后一组
+
         if ($src_i > 0) {
-            // 填充剩余字节
             for ($j = $src_i; $j < 8; $j++) {
                 $src_buf[$j] = 0;
             }
-            
-            // 异或前一块密文
             for ($j = 0; $j < 8; $j++) {
                 $src_buf[$j] ^= $iv_crypt[$j];
             }
-            
             $temp_out = $this->teaEncryptECB(pack('C*', ...$src_buf), $pKey);
             $temp_bytes = array_values(unpack('C*', $temp_out));
-            
-            // 异或前一块明文
             for ($j = 0; $j < 8; $j++) {
                 $temp_bytes[$j] ^= $iv_plain[$j];
             }
-            
             $pOutBuf .= pack('C*', ...$temp_bytes);
         }
-        
+
         return $pOutBuf;
     }
-    
+
     /**
      * CBC模式解密
      */
@@ -465,34 +512,28 @@ class CKeyManager
         if (($nInBufLen % 8) != 0 || $nInBufLen < 16) {
             return false;
         }
-        
-        // 解密第一个块
+
         $dest_buf_str = $this->teaDecryptECB(substr($pInBuf, 0, 8), $pKey);
         $dest_buf = array_values(unpack('C*', $dest_buf_str));
-        
+
         $nPadLen = $dest_buf[0] & 0x07;
-        
-        // 计算明文长度
+
         $i = $nInBufLen - 1;
         $i = $i - $nPadLen - self::SALT_LEN - self::ZERO_LEN;
-        
+
         if ($i < 0) {
             return false;
         }
-        
+
         $pOutBufLen = $i;
-        
-        // 初始化IV
+
         $iv_pre_crypt = array_fill(0, 8, 0);
         $iv_cur_crypt = array_values(unpack('C*', substr($pInBuf, 0, 8)));
-        
+
         $pInBufOffset = 8;
         $dest_i = 1;
-        
-        // 跳过Padding
         $dest_i += $nPadLen;
-        
-        // 跳过Salt
+
         $salt_count = 1;
         while ($salt_count <= self::SALT_LEN) {
             if ($dest_i < 8) {
@@ -501,26 +542,22 @@ class CKeyManager
             } elseif ($dest_i == 8) {
                 $iv_pre_crypt = $iv_cur_crypt;
                 $iv_cur_crypt = array_values(unpack('C*', substr($pInBuf, $pInBufOffset, 8)));
-                
                 for ($j = 0; $j < 8; $j++) {
                     if ($pInBufOffset + $j >= $nInBufLen) {
                         return false;
                     }
                     $dest_buf[$j] ^= $iv_cur_crypt[$j];
                 }
-                
                 $temp_buf = $this->teaDecryptECB(pack('C*', ...$dest_buf), $pKey);
                 $dest_buf = array_values(unpack('C*', $temp_buf));
-                
                 $pInBufOffset += 8;
                 $dest_i = 0;
             }
         }
-        
-        // 还原明文
+
         $nPlainLen = $pOutBufLen;
         $plain_bytes = [];
-        
+
         while ($nPlainLen > 0) {
             if ($dest_i < 8) {
                 $plain_bytes[] = $dest_buf[$dest_i] ^ $iv_pre_crypt[$dest_i];
@@ -529,27 +566,24 @@ class CKeyManager
             } elseif ($dest_i == 8) {
                 $iv_pre_crypt = $iv_cur_crypt;
                 $iv_cur_crypt = array_values(unpack('C*', substr($pInBuf, $pInBufOffset, 8)));
-                
                 for ($j = 0; $j < 8; $j++) {
                     if ($pInBufOffset + $j >= $nInBufLen) {
                         return false;
                     }
                     $dest_buf[$j] ^= $iv_cur_crypt[$j];
                 }
-                
                 $temp_buf = $this->teaDecryptECB(pack('C*', ...$dest_buf), $pKey);
                 $dest_buf = array_values(unpack('C*', $temp_buf));
-                
                 $pInBufOffset += 8;
                 $dest_i = 0;
             }
         }
-        
+
         return pack('C*', ...$plain_bytes);
     }
 
     /**
-     * 按 vsCKey::task_encGuard 生成 ck_guard_time。
+     * 按 vsCKey::task_encGuard 生成 ck_guard_time
      */
     private function generateCkGuardTime($timestamp, $guid, $guardData = '-1', $packageName = 'null', $processName = 'null')
     {
@@ -583,197 +617,118 @@ class CKeyManager
         $value = (string)$value;
         return strlen($value) >= 5 ? substr($value, -5) : '';
     }
-    
+
     // ================== 公开的加解密方法 ===================
-    
-    /**
-     * 加密数据生成cKey
-     * @param string $data 要加密的数据
-     * @return string 生成的cKey
-     */
+
     public function encryptDataToCKey($data)
     {
         $teaCkey = hex2bin(self::TEA_CKEY);
-        
-        // 计算数据长度
         $data_len = strlen($data);
-        
-        // 计算校验和
         $data_array = array_values(unpack('C*', $data));
         $checksum = $this->calcSignature($data_array);
-        
-        // TEA加密
         $encrypted = $this->oiSymmetryEncrypt2($data, $data_len, $teaCkey);
-        
-        // 添加校验和
         $encrypted .= pack('N', $checksum);
-        
-        // XOR加密
         $encrypted_array = array_values(unpack('C*', $encrypted));
         $xor_array = $this->xorArray($encrypted_array);
         $xor_encrypted = pack('C*', ...$xor_array);
-        
-        // Base64编码
         $base64_encoded = $this->customEncode($xor_encrypted);
-        
         return "--01" . $base64_encoded;
     }
-    
-    /**
-     * 解密cKey获取数据
-     * @param string $ckey 要解密的cKey
-     * @return array|false 解密后的数据和校验和，或false表示失败
-     */
+
     public function decryptCKeyToData($ckey)
     {
         $teaCkey = hex2bin(self::TEA_CKEY);
-        
-        // 移除前缀
         $ckey_without_prefix = substr($ckey, 4);
-        
-        // 自定义Base64解码
         $base64_decoded = $this->customDecode($ckey_without_prefix);
         if (!$base64_decoded) {
             return false;
         }
-        
-        // XOR解密
         $xor_array = array_values(unpack('C*', $base64_decoded));
         $xor_decrypted_array = $this->xorArray($xor_array);
         $xor_decrypted = pack('C*', ...$xor_decrypted_array);
-        
-        // 分离数据和校验和
         $data_len = strlen($xor_decrypted) - 4;
         $encrypted_data = substr($xor_decrypted, 0, $data_len);
         $checksum_bytes = substr($xor_decrypted, $data_len);
         $checksum = unpack('N', $checksum_bytes)[1];
-        
-        // TEA解密
         $decrypted = $this->oiSymmetryDecrypt2($encrypted_data, $data_len, $teaCkey);
-        
         return [
             'data' => $decrypted,
             'checksum' => $checksum
         ];
     }
-    
+
     // ================== 数据包构建方法 ===================
-    
-    /**
-     * 构建数据包
-     * @param array $params 参数数组
-     * @return string 构建的数据包
-     */
+
     public function buildPacket($params)
     {
         $data = '';
-        
-        // 1. 头部 (12字节) - 固定值
         $data .= hex2bin('0000004200000004000004d2');
-        
-        // 2. Platform (4字节)
         $data .= pack('N', $params['Platform']);
-        
-        // 3. Signature (4字节) - 先置0，后面计算
         $data .= pack('N', 0);
-        
-        // 4. Timestamp (4字节)
         $data .= pack('N', $params['Timestamp']);
-        
-        // 5. Sdtfrom (长度+字符串)
+
         $sdtfrom = $params['Sdtfrom'];
         $data .= pack('n', strlen($sdtfrom)) . $sdtfrom;
-        
-        // 6. randFlag (长度+字符串) - 使用传入的值
+
         $randFlag = $params['randFlag'];
         $data .= pack('n', strlen($randFlag)) . $randFlag;
-        
-        // 7. appVer (长度+字符串)
+
         $appVer = $params['appVer'];
         $data .= pack('n', strlen($appVer)) . $appVer;
-        
-        // 8. vid (长度+字符串)
+
         $vid = $params['vid'];
         $data .= pack('n', strlen($vid)) . $vid;
-        
-        // 9. guid (长度+字符串)
+
         $guid = $params['guid'];
         $data .= pack('n', strlen($guid)) . $guid;
-        
-        // 10. part1 (4字节)
+
         $data .= pack('N', 1);
-        
-        // 11. isDlna (4字节) - 根据原始样本是0
         $data .= pack('N', 1);
-        
-        // 12. uid (长度+字符串)
+
         $uid = "2622783A";
         $data .= pack('n', strlen($uid)) . $uid;
-        
-        // 13. bundleID (长度+字符串)
+
         $bundleID = "nil";
         $data .= pack('n', strlen($bundleID)) . $bundleID;
-        
-        // 14. uuid4 (长度+字符串)
+
         $uuid4 = $params['uuid4'];
         $data .= pack('n', strlen($uuid4)) . $uuid4;
-        
-        // 15. bundleID1 (长度+字符串) - 重复bundleID
+
         $data .= pack('n', strlen($bundleID)) . $bundleID;
-        
-        // 16. ckeyVersion (长度+字符串)
+
         $ckeyVersion = "v0.1.000";
         $data .= pack('n', strlen($ckeyVersion)) . $ckeyVersion;
-        
-        // 17. packageName (长度+字符串)
+
         $packageName = "com.cctv.yangshipin.app.iphone";
         $data .= pack('n', strlen($packageName)) . $packageName;
-        
-        // 18. platform_str (长度+字符串)
+
         $platform_str = "4330403";
         $data .= pack('n', strlen($platform_str)) . $platform_str;
-        
-        // 19. ex_json_bus (长度+字符串)
+
         $ex_json_bus = "ex_json_bus";
         $data .= pack('n', strlen($ex_json_bus)) . $ex_json_bus;
-        
-        // 20. ex_json_vs (长度+字符串)
+
         $ex_json_vs = "ex_json_vs";
         $data .= pack('n', strlen($ex_json_vs)) . $ex_json_vs;
-        
-        // 21. ck_guard_time (长度+字符串) - 88个字符
+
         $ck_guard_time = $params['ck_guard_time'];
         $data .= pack('n', strlen($ck_guard_time)) . $ck_guard_time;
-        
-        // 验证主体长度
+
         $body_length = strlen($data);
-        
-        // 添加长度头
         $buffer = pack('n', $body_length) . $data;
-        
-        // 计算签名
         $buffer_array = array_values(unpack('C*', $buffer));
         $signature = $this->calcSignature($buffer_array);
-        
-        // 更新签名（位置：跳过长度头2字节+头部12字节+Platform4字节=18字节处）
         $buffer = substr($buffer, 0, 18) . pack('N', $signature) . substr($buffer, 22);
-        
+
         return $buffer;
     }
-    
-    /**
-     * 生成完整的cKey
-     * @param string $cnlid 频道ID
-     * @param int|null $timestamp 时间戳
-     * @return array 包含cKey、参数和数据包的数组
-     */
+
     public function generateCKey($cnlid, $timestamp = null)
     {
         if ($timestamp === null) {
             $timestamp = time();
         }
-        
-        // 生成所有随机值
+
         $randFlag = base64_encode(random_bytes(18));
         $uuid4 = sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
             mt_rand(0, 0xffff), mt_rand(0, 0xffff),
@@ -789,45 +744,33 @@ class CKeyManager
             'Timestamp' => $timestamp,
             'Sdtfrom' => 'dcgh',
             'vid' => $cnlid,
-            'guid' => $this->guid, // 使用当前GUID
+            'guid' => $this->guid,
             'appVer' => 'V8.22.1035.3031',
             'randFlag' => $randFlag,
             'uuid4' => '57eab0c4-2c58-44c6-8ae9-dd2757525dc5',
             'ck_guard_time' => $ck_guard_time
         ];
-        
+
         $buffer = $this->buildPacket($params);
         $ckey = $this->encryptDataToCKey($buffer);
-        
+
         return [
             'ckey' => $ckey,
             'params' => $params,
             'buffer' => $buffer
         ];
     }
-    
-    // ================== 网络请求方法（优化版本） ===================
-    
-    /**
-     * 发起直播或回看请求（优化版）
-     * @param string $cnlid 频道ID
-     * @param string $livepid 直播ID
-     * @param string $defn 清晰度
-     * @param string|null $playseek 回看时间（格式：YYYYMMDDHHMMSS-YYYYMMDDHHMMSS）
-     * @return array 请求结果
-     */
+
+    // ================== 网络请求方法 ===================
+
     public function makeLiveRequest($cnlid, $livepid = '600001859', $defn = 'fhd', $playseek = null)
     {
-        // 每次请求生成新的随机GUID
         $this->generateGuid();
-        
-        // 只生成一次cKey（直播和回看使用相同的cKey参数）
         $ckeyResult = $this->generateCKey($cnlid);
         $ckey = $ckeyResult['ckey'];
         $params = $ckeyResult['params'];
-        
-        // 生成flowid
-        $flowid = sprintf('%s_%d', 
+
+        $flowid = sprintf('%s_%d',
             sprintf('%04X%04X-%04X-%04X-%04X-%04X%04X%04X',
                 mt_rand(0, 0xffff), mt_rand(0, 0xffff),
                 mt_rand(0, 0xffff),
@@ -837,12 +780,10 @@ class CKeyManager
             ),
             4330403
         );
-        
-        // 提前判断模式并设置参数
+
         $isPlayback = !empty($playseek);
         $playbackTimestamp = null;
-        
-        // 处理回看时间
+
         if ($isPlayback) {
             try {
                 $parts = explode('-', $playseek);
@@ -860,9 +801,7 @@ class CKeyManager
                 ];
             }
         }
-        
-        // 构建基础请求参数（根据模式设置不同参数）
-        $spvcode = $this->spvcode($defn);
+
         $request_params = [
             "atime" => "120",
             "livepid" => $livepid,
@@ -904,25 +843,18 @@ class CKeyManager
             "fntick" => $params['Timestamp'],
             "flowid" => $flowid,
         ];
-        // 根据模式设置不同的参数
+
         if ($isPlayback) {
-            // 回看模式：第一次尝试 - 添加playbacktime参数
             $request_params['playbacktime'] = $playbackTimestamp;
-            
-            // 发送第一次请求
             $response = $this->sendHttpRequest($request_params);
-            
+
             if ($response['success'] && isset($response['response']['playurl'])) {
                 return $response;
             } else {
-                // 第二次尝试 - 不添加playbacktime参数
                 unset($request_params['playbacktime']);
-                
-                // 发送第二次请求
                 $response = $this->sendHttpRequest($request_params);
-                
+
                 if ($response['success'] && isset($response['response']['playurl'])) {
-                    // 手动处理URL：修改域名并添加starttime参数
                     $playurl = $response['response']['playurl'];
                     $playurl = $this->processPlaybackUrl($playurl, $playbackTimestamp);
                     $response['response']['playurl'] = $playurl;
@@ -937,49 +869,31 @@ class CKeyManager
                 }
             }
         } else {
-            // 直播模式：设置playbacktime为0
             $request_params['playbacktime'] = "0";
-            
-            // 发送请求
             return $this->sendHttpRequest($request_params);
         }
     }
-    
-    /**
-     * 处理回看URL
-     * @param string $playurl 原始播放URL
-     * @param int $playbackTimestamp 回看时间戳
-     * @return string 处理后的URL
-     */
+
     private function processPlaybackUrl($playurl, $playbackTimestamp)
     {
-        // 修改域名
         $urlParts = explode('/', $playurl);
         if (count($urlParts) >= 3) {
             $urlParts[2] = 'tlivecloud-playback-cdn.ysp.cctv.cn/tcloud.cctv.com';
             $playurl = implode('/', $urlParts);
-            
-            // 添加starttime参数
             if (strpos($playurl, '?') !== false) {
                 $playurl .= '&starttime=' . $playbackTimestamp;
             } else {
                 $playurl .= '?starttime=' . $playbackTimestamp;
             }
         }
-        
         return $playurl;
     }
-    
-    /**
-     * 发送HTTP请求
-     * @param array $params 请求参数
-     * @return array 请求结果
-     */
+
     private function sendHttpRequest($params)
     {
         $url = "https://bkliveinfo.ysp.cctv.cn";
         $query_string = http_build_query($params);
-        
+
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url . '?' . $query_string);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -992,12 +906,12 @@ class CKeyManager
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        
+
         $response = curl_exec($ch);
         $error = curl_error($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
-        
+
         if ($error) {
             return [
                 'success' => false,
@@ -1005,7 +919,7 @@ class CKeyManager
                 'http_code' => $http_code
             ];
         }
-        
+
         $data = json_decode($response, true);
         if ($data) {
             if (isset($data['iretcode'])) {
@@ -1015,17 +929,15 @@ class CKeyManager
                     'http_code' => $http_code,
                     'response' => $data
                 ];
-                
                 if ($data['iretcode'] == 0) {
                     $result['playurl'] = $data['playurl'] ?? null;
                 } else {
                     $result['error'] = $data['errinfo'] ?? '未知错误';
                 }
-                
                 return $result;
             }
         }
-        
+
         return [
             'success' => false,
             'error' => '无效的JSON响应',
@@ -1033,15 +945,7 @@ class CKeyManager
             'raw_response' => substr($response, 0, 500)
         ];
     }
-    
-    /**
-     * 简化版获取播放地址（支持回看）
-     * @param string $cnlid 频道ID
-     * @param string $livepid 直播ID（可选，默认600001859）
-     * @param string $defn 清晰度（可选，默认fhd）
-     * @param string|null $playseek 回看时间（可选，null表示直播）
-     * @return string|null 播放地址或null
-     */
+
     public function getPlayUrl($cnlid, $livepid = '600001859', $defn = 'fhd', $playseek = null)
     {
         $result = $this->makeLiveRequest($cnlid, $livepid, $defn, $playseek);
@@ -1050,186 +954,143 @@ class CKeyManager
         }
         return null;
     }
-    
+
     // ================== 数据包解析方法 ===================
-    
-    /**
-     * 解析数据包
-     * @param string $data 数据包二进制数据
-     * @return array 解析后的字段数组
-     */
+
     public function parsePacket($data)
     {
         if (strlen($data) < 2) {
             return false;
         }
-        
+
         $pos = 0;
         $result = [];
-        
-        // 1. 长度头 (2字节)
+
         $result['packet_len'] = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
-        
-        // 2. 固定头部 (12字节)
         $result['header'] = substr($data, $pos, 12);
         $pos += 12;
-        
-        // 3. Platform (4字节)
         $result['platform'] = unpack('N', substr($data, $pos, 4))[1];
         $pos += 4;
-        
-        // 4. Signature (4字节)
         $result['signature'] = unpack('N', substr($data, $pos, 4))[1];
         $pos += 4;
-        
-        // 5. Timestamp (4字节)
         $result['timestamp'] = unpack('N', substr($data, $pos, 4))[1];
         $pos += 4;
-        
-        // 6. Sdtfrom (长度+字符串)
+
         $sdtfrom_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['sdtfrom'] = substr($data, $pos, $sdtfrom_len);
         $pos += $sdtfrom_len;
-        
-        // 7. randFlag (长度+字符串)
+
         $randFlag_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['randFlag'] = substr($data, $pos, $randFlag_len);
         $pos += $randFlag_len;
-        
-        // 8. appVer (长度+字符串)
+
         $appVer_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['appVer'] = substr($data, $pos, $appVer_len);
         $pos += $appVer_len;
-        
-        // 9. vid (长度+字符串)
+
         $vid_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['vid'] = substr($data, $pos, $vid_len);
         $pos += $vid_len;
-        
-        // 10. guid (长度+字符串)
+
         $guid_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['guid'] = substr($data, $pos, $guid_len);
         $pos += $guid_len;
-        
-        // 11. part1 (4字节)
+
         $result['part1'] = unpack('N', substr($data, $pos, 4))[1];
         $pos += 4;
-        
-        // 12. isDlna (4字节)
         $result['isDlna'] = unpack('N', substr($data, $pos, 4))[1];
         $pos += 4;
-        
-        // 13. uid (长度+字符串)
+
         $uid_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['uid'] = substr($data, $pos, $uid_len);
         $pos += $uid_len;
-        
-        // 14. bundleID (长度+字符串)
+
         $bundleID_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['bundleID'] = substr($data, $pos, $bundleID_len);
         $pos += $bundleID_len;
-        
-        // 15. uuid4 (长度+字符串)
+
         $uuid4_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['uuid4'] = substr($data, $pos, $uuid4_len);
         $pos += $uuid4_len;
-        
-        // 16. bundleID1 (长度+字符串)
+
         $bundleID1_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['bundleID1'] = substr($data, $pos, $bundleID1_len);
         $pos += $bundleID1_len;
-        
-        // 17. ckeyVersion (长度+字符串)
+
         $ckeyVersion_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['ckeyVersion'] = substr($data, $pos, $ckeyVersion_len);
         $pos += $ckeyVersion_len;
-        
-        // 18. packageName (长度+字符串)
+
         $packageName_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['packageName'] = substr($data, $pos, $packageName_len);
         $pos += $packageName_len;
-        
-        // 19. platform_str (长度+字符串)
+
         $platform_str_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['platform_str'] = substr($data, $pos, $platform_str_len);
         $pos += $platform_str_len;
-        
-        // 20. ex_json_bus (长度+字符串)
+
         $ex_json_bus_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['ex_json_bus'] = substr($data, $pos, $ex_json_bus_len);
         $pos += $ex_json_bus_len;
-        
-        // 21. ex_json_vs (长度+字符串)
+
         $ex_json_vs_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['ex_json_vs'] = substr($data, $pos, $ex_json_vs_len);
         $pos += $ex_json_vs_len;
-        
-        // 22. ck_guard_time (长度+字符串)
+
         $ck_guard_time_len = unpack('n', substr($data, $pos, 2))[1];
         $pos += 2;
         $result['ck_guard_time'] = substr($data, $pos, $ck_guard_time_len);
         $pos += $ck_guard_time_len;
-        
+
         $result['total_size'] = strlen($data);
         $result['parsed_size'] = $pos;
         $result['remaining'] = substr($data, $pos);
-        
+
         return $result;
     }
-    
-    /**
-     * 验证cKey
-     * @param string $ckey cKey字符串
-     * @return bool 是否验证通过
-     */
+
     public function verifyCKey($ckey)
     {
         $decrypt_result = $this->decryptCKeyToData($ckey);
         if (!$decrypt_result) {
             return false;
         }
-        
         $calculated_checksum = $this->calcSignature(array_values(unpack('C*', $decrypt_result['data'])));
         return $decrypt_result['checksum'] == $calculated_checksum;
     }
-    
-    /**
-     * 解析回看时间字符串
-     * @param string $playseek 回看时间字符串（格式：YYYYMMDDHHMMSS-YYYYMMDDHHMMSS）
-     * @return array 包含开始时间和结束时间的数组
-     */
+
     public function parsePlayseek($playseek)
     {
         $parts = explode('-', $playseek);
         if (count($parts) !== 2) {
             throw new Exception("回看时间格式错误，应为: YYYYMMDDHHMMSS-YYYYMMDDHHMMSS");
         }
-        
+
         $startTimeStr = $parts[0];
         $endTimeStr = $parts[1];
-        
+
         $startTime = DateTime::createFromFormat('YmdHis', $startTimeStr, new DateTimeZone('Asia/Shanghai'));
         $endTime = DateTime::createFromFormat('YmdHis', $endTimeStr, new DateTimeZone('Asia/Shanghai'));
-        
+
         if ($startTime === false || $endTime === false) {
             throw new Exception("回看时间解析失败");
         }
-        
+
         return [
             'start_time' => $startTime,
             'end_time' => $endTime,
@@ -1240,48 +1101,39 @@ class CKeyManager
             'duration' => $endTime->getTimestamp() - $startTime->getTimestamp()
         ];
     }
-    
-    /**
-     * 生成回看时间字符串
-     * @param string $startDateTime 开始时间（格式：Y-m-d H:i:s）
-     * @param string $endDateTime 结束时间（格式：Y-m-d H:i:s）
-     * @return string 回看时间字符串
-     */
+
     public function generatePlayseek($startDateTime, $endDateTime)
     {
         $startTime = DateTime::createFromFormat('Y-m-d H:i:s', $startDateTime, new DateTimeZone('Asia/Shanghai'));
         $endTime = DateTime::createFromFormat('Y-m-d H:i:s', $endDateTime, new DateTimeZone('Asia/Shanghai'));
-        
+
         if ($startTime === false || $endTime === false) {
             throw new Exception("时间格式错误，应为: Y-m-d H:i:s");
         }
-        
+
         return $startTime->format('YmdHis') . '-' . $endTime->format('YmdHis');
     }
 }
 
 $ckeyManager = new CKeyManager();
 $playseek = $_GET['playseek'] ?? null;
-// 缓存配置（仅用于直播）
 $cookieKey = 'playurl_cache';
-$cacheTimeoutLive = 80; // 直播缓存超时 4分钟
-$cookieExpire = time() + 3600; // Cookie本身有效期1小时
+$cacheTimeoutLive = 80;
+$cookieExpire = time() + 3600;
 
-// 读取缓存
 $cacheJson = $_COOKIE[$cookieKey] ?? '{}';
 $cache = json_decode($cacheJson, true) ?: [];
 
 $now = time();
-$isLive = ($playseek === null || $playseek === ''); // 无playseek参数视为直播
+$isLive = ($playseek === null || $playseek === '');
 
 $playUrl = null;
 $m3u8Content = false;
 $maxAttempts = 2;
 
 for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
-    $needRefresh = true; // 默认需要刷新
+    $needRefresh = true;
 
-    // 仅在第一次尝试且为直播时检查缓存
     if ($attempt == 1 && $isLive) {
         if (isset($cache[$id]) && is_array($cache[$id])) {
             $entry = $cache[$id];
@@ -1291,7 +1143,6 @@ for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             }
         }
     }
-    // 点播模式或直播缓存失效/不存在时，needRefresh保持true
 
     if ($needRefresh) {
         $playUrl = $ckeyManager->getPlayUrl($n[$id][0], $n[$id][1], $n[$id][2], $playseek);
@@ -1299,7 +1150,6 @@ for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             die("获取播放地址失败\n");
         }
 
-        // 只有直播才更新缓存
         if ($isLive) {
             $cache[$id] = [
                 'url' => $playUrl,
@@ -1307,35 +1157,30 @@ for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             ];
             setcookie($cookieKey, json_encode($cache), $cookieExpire, '/');
         } else {
-            // 点播模式直接跳转（不输出M3U8）
             header("Location: " . $playUrl);
             exit();
         }
     }
 
-    // 获取 M3U8 内容（仅直播模式会走到这里，点播已在上面跳转）
     $m3u8Content = @file_get_contents($playUrl);
     if ($m3u8Content === false) {
-        $m3u8Content = false; // 明确设为false，进入后续重试判断
+        $m3u8Content = false;
     }
 
     if ($m3u8Content !== false) {
-        break; // 成功获取，跳出循环
+        break;
     }
 
-    // 获取失败：如果是第一次尝试且使用了缓存地址，则清除缓存
     if ($attempt == 1 && $isLive && !$needRefresh) {
         unset($cache[$id]);
         setcookie($cookieKey, json_encode($cache), $cookieExpire, '/');
     }
-    // 继续下一次尝试
 }
 
 if ($m3u8Content === false) {
     die("无法获取 M3U8 内容，请稍后重试\n");
 }
 
-// 补全 TS 路径（仅直播）
 $baseUrl = substr($playUrl, 0, strrpos($playUrl, '/') + 1);
 header('Content-Type: application/vnd.apple.mpegurl');
 print_r(preg_replace("/(.*?.ts)/i", $baseUrl."$1",$m3u8Content));
